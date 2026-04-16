@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>無人機槳葉原理：力量量化實驗室</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'PingFang TC', 'Microsoft JhengHei', sans-serif; }
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 4px 25px rgba(0,0,0,0.5);
+            width: 360px;
+        }
+        canvas { display: block; }
+        .force-label {
+            position: absolute;
+            pointer-events: none;
+            background: rgba(0, 0, 0, 0.85);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: bold;
+            display: none;
+            border: 1px solid rgba(255,255,255,0.3);
+            transform: translate(-50%, -100%);
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+        }
+        .bar-container { height: 12px; background: #e2e8f0; border-radius: 6px; overflow: hidden; position: relative; }
+        .bar-fill { height: 100%; transition: width 0.3s ease-out, background-color 0.3s; }
+        .zero-line { position: absolute; left: 50%; top: 0; width: 2px; height: 100%; background: #64748b; z-index: 1; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-container">
+        <h1 class="text-xl font-bold text-blue-600 mb-2">🚁 槳葉力學實驗室</h1>
+        
+        <div class="mb-4">
+            <label class="block text-sm font-medium text-gray-700 font-bold">槳葉角度 (0° 為垂直)：<span id="angleValue" class="text-blue-600 text-lg">0</span>°</label>
+            <input type="range" id="angleSlider" min="-75" max="75" value="0" class="w-full h-2 bg-blue-200 rounded-lg appearance-none cursor-pointer mt-2">
+        </div>
+
+        <!-- 數據儀錶板 -->
+        <div class="bg-slate-100 p-4 rounded-xl mb-4 space-y-4 border border-slate-200">
+            <div>
+                <div class="flex justify-between text-xs mb-1">
+                    <span class="text-green-700 font-bold">🟢 垂直力 (Lift / Downforce)</span>
+                    <span id="liftVal" class="font-mono text-sm font-bold">0.00 units</span>
+                </div>
+                <div class="bar-container">
+                    <div class="zero-line"></div>
+                    <div id="liftBar" class="bar-fill bg-green-500" style="width: 0%; margin-left: 50%;"></div>
+                </div>
+            </div>
+            <div>
+                <div class="flex justify-between text-xs mb-1">
+                    <span class="text-red-700 font-bold">🔴 水平阻力 (Drag Force)</span>
+                    <span id="dragVal" class="font-mono text-sm font-bold">1.00 units</span>
+                </div>
+                <div class="bar-container">
+                    <div id="dragBar" class="bar-fill bg-red-500" style="width: 100%"></div>
+                </div>
+            </div>
+        </div>
+
+        <button id="fireBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition-all active:scale-95 mb-4">
+            發射空氣分子 (Action)
+        </button>
+    </div>
+
+    <div id="label-lift" class="force-label">垂直力</div>
+    <div id="label-drag" class="force-label">阻力</div>
+
+    <script>
+        let scene, camera, renderer, paddle, ball, controls;
+        let isBallActive = false;
+        let ballVelocity = new THREE.Vector3(0, 0, 0);
+        let trailPoints = [];
+        let trailMesh, vectorGroup, airComponentGroup;
+        const raycaster = new THREE.Raycaster();
+        // 縮短發射起始點
+        const startPos = new THREE.Vector3(-12, 0, 0);
+        
+        let labelPos = { lift: null, drag: null };
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf1f5f9);
+
+            camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 1000);
+            // 縮短相機距離
+            camera.position.set(15, 12, 22);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+            const light = new THREE.DirectionalLight(0xffffff, 0.7);
+            light.position.set(5, 10, 5);
+            scene.add(light);
+
+            scene.add(new THREE.GridHelper(50, 25, 0xd1d5db, 0xe5e7eb));
+
+            // 槳葉
+            paddle = new THREE.Mesh(
+                new THREE.BoxGeometry(0.3, 10, 6),
+                new THREE.MeshPhongMaterial({ color: 0x1e40af, transparent: true, opacity: 0.7 })
+            );
+            scene.add(paddle);
+
+            // 空氣分子
+            ball = new THREE.Mesh(
+                new THREE.SphereGeometry(0.5, 32, 32),
+                new THREE.MeshPhongMaterial({ color: 0x475569 })
+            );
+            ball.position.copy(startPos);
+            scene.add(ball);
+
+            vectorGroup = new THREE.Group();
+            scene.add(vectorGroup);
+
+            airComponentGroup = new THREE.Group();
+            scene.add(airComponentGroup);
+
+            trailMesh = new THREE.Group();
+            scene.add(trailMesh);
+
+            document.getElementById('angleSlider').oninput = (e) => {
+                const angle = parseInt(e.target.value);
+                document.getElementById('angleValue').innerText = angle;
+                paddle.rotation.z = THREE.MathUtils.degToRad(angle);
+                resetScene();
+                calculateTheoreticalForces(angle);
+            };
+
+            document.getElementById('fireBtn').onclick = fireBall;
+            window.onresize = onWindowResize;
+            
+            calculateTheoreticalForces(0);
+            animate();
+        }
+
+        function calculateTheoreticalForces(angleDeg) {
+            const angleRad = THREE.MathUtils.degToRad(angleDeg);
+            const drag = Math.pow(Math.cos(angleRad), 2);
+            const lift = Math.sin(2 * angleRad); 
+
+            document.getElementById('liftVal').innerText = lift.toFixed(2) + " units";
+            document.getElementById('dragVal').innerText = drag.toFixed(2) + " units";
+
+            const liftBar = document.getElementById('liftBar');
+            const liftPercent = Math.abs(lift) * 50;
+            liftBar.style.width = liftPercent + "%";
+            liftBar.style.marginLeft = lift >= 0 ? "50%" : (50 - liftPercent) + "%";
+            liftBar.style.backgroundColor = lift >= 0 ? "#22c55e" : "#f59e0b";
+
+            document.getElementById('dragBar').style.width = (drag * 100) + "%";
+        }
+
+        function resetScene() {
+            while(vectorGroup.children.length > 0) vectorGroup.remove(vectorGroup.children[0]);
+            while(airComponentGroup.children.length > 0) airComponentGroup.remove(airComponentGroup.children[0]);
+            while(trailMesh.children.length > 0) trailMesh.remove(trailMesh.children[0]);
+            trailPoints = [];
+            ball.material.color.setHex(0x475569);
+            hideLabels();
+        }
+
+        function hideLabels() {
+            document.querySelectorAll('.force-label').forEach(el => el.style.display = 'none');
+            labelPos = { lift: null, drag: null };
+        }
+
+        function fireBall() {
+            if (isBallActive) return;
+            resetScene();
+            isBallActive = true;
+            ball.position.copy(startPos);
+            ballVelocity.set(0.4, 0, 0); 
+            document.getElementById('fireBtn').disabled = true;
+            document.getElementById('fireBtn').classList.add('opacity-50');
+        }
+
+        function updateTrailMesh() {
+            if (trailPoints.length < 2) return;
+            while(trailMesh.children.length > 0) trailMesh.remove(trailMesh.children[0]);
+            const curve = new THREE.CatmullRomCurve3(trailPoints);
+            // 加粗一點點 path
+            const geometry = new THREE.TubeGeometry(curve, trailPoints.length, 0.2, 8, false);
+            const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0xffffff }));
+            trailMesh.add(mesh);
+        }
+
+        // 建立厚指標箭頭
+        function createExtraThickArrow(start, end, color, radius = 0.25) {
+            const dir = new THREE.Vector3().subVectors(end, start);
+            const len = dir.length();
+            if (len < 0.2) return;
+
+            const group = new THREE.Group();
+
+            // 柄部 (圓柱體) - 縮短一倍
+            const shaftLen = len * 0.7;
+            const shaftGeo = new THREE.CylinderGeometry(radius, radius, shaftLen, 16);
+            const shaftMat = new THREE.MeshPhongMaterial({ color: color });
+            const shaft = new THREE.Mesh(shaftGeo, shaftMat);
+            shaft.position.set(0, shaftLen / 2, 0);
+
+            // 箭頭 (錐體)
+            const headLen = len * 0.3;
+            const headGeo = new THREE.ConeGeometry(radius * 2.5, headLen, 16);
+            const headMat = new THREE.MeshPhongMaterial({ color: color });
+            const head = new THREE.Mesh(headGeo, headMat);
+            head.position.set(0, shaftLen + headLen / 2, 0);
+
+            group.add(shaft);
+            group.add(head);
+
+            const up = new THREE.Vector3(0, 1, 0);
+            group.quaternion.setFromUnitVectors(up, dir.clone().normalize());
+            group.position.copy(start);
+
+            vectorGroup.add(group);
+        }
+
+        function drawPhysics(hitPoint, vIn, vOut) {
+            resetScene();
+            // 縮短力向量倍數 35 -> 18
+            const scale = 18;
+
+            // 空氣分量指標 4.5 -> 2.5
+            const airV = new THREE.Vector3(0, vOut.y, 0).normalize().multiplyScalar(2.5);
+            const airH = new THREE.Vector3(vOut.x, 0, 0).normalize().multiplyScalar(2.5);
+            createExtraThickArrow(hitPoint, hitPoint.clone().add(airV), 0x94a3b8, 0.12); 
+            createExtraThickArrow(hitPoint, hitPoint.clone().add(airH), 0x94a3b8, 0.12);
+
+            const impulse = vOut.clone().sub(vIn);
+            const forceOnBlade = impulse.clone().multiplyScalar(-1);
+            
+            const liftVec = new THREE.Vector3(0, forceOnBlade.y, 0).multiplyScalar(scale);
+            const dragVec = new THREE.Vector3(forceOnBlade.x, 0, 0).multiplyScalar(scale);
+
+            if (Math.abs(liftVec.y) > 0.05) {
+                labelPos.lift = hitPoint.clone().add(liftVec);
+                const liftColor = liftVec.y >= 0 ? 0x22c55e : 0xf59e0b;
+                const label = document.getElementById('label-lift');
+                label.innerText = liftVec.y >= 0 ? "升力 (Lift)" : "下壓力 (Downforce)";
+                label.style.color = liftVec.y >= 0 ? "#4ade80" : "#fbbf24";
+                createExtraThickArrow(hitPoint, labelPos.lift, liftColor); 
+            }
+
+            if (Math.abs(dragVec.x) > 0.05) {
+                labelPos.drag = hitPoint.clone().add(dragVec);
+                createExtraThickArrow(hitPoint, labelPos.drag, 0xef4444);
+            }
+        }
+
+        function updateLabels() {
+            Object.keys(labelPos).forEach(key => {
+                const pos = labelPos[key];
+                const el = document.getElementById('label-' + key);
+                if (pos && el) {
+                    const screenPos = pos.clone().project(camera);
+                    el.style.display = 'block';
+                    el.style.left = (screenPos.x * 0.5 + 0.5) * window.innerWidth + 'px';
+                    el.style.top = (screenPos.y * -0.5 + 0.5) * window.innerHeight + 'px';
+                }
+            });
+        }
+
+        function checkCollision() {
+            if (!isBallActive) return;
+            raycaster.set(ball.position, ballVelocity.clone().normalize());
+            raycaster.far = ballVelocity.length() + 0.5;
+            const intersects = raycaster.intersectObject(paddle);
+            if (intersects.length > 0) {
+                const hit = intersects[0];
+                const normal = hit.face.normal.clone().applyQuaternion(paddle.quaternion);
+                if (ballVelocity.dot(normal) < 0) {
+                    const vIn = ballVelocity.clone();
+                    const vOut = ballVelocity.clone().sub(normal.multiplyScalar(2 * ballVelocity.dot(normal)));
+                    drawPhysics(hit.point, vIn, vOut);
+                    ball.material.color.setHex(0x3b82f6);
+                    ballVelocity.copy(vOut);
+                    ball.position.copy(hit.point).add(normal.multiplyScalar(0.4));
+                }
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            updateLabels();
+            if (isBallActive) {
+                trailPoints.push(ball.position.clone());
+                updateTrailMesh();
+                checkCollision();
+                ball.position.add(ballVelocity);
+                // 縮短消失距離 50 -> 25
+                if (ball.position.length() > 25) {
+                    isBallActive = false;
+                    document.getElementById('fireBtn').disabled = false;
+                    document.getElementById('fireBtn').classList.remove('opacity-50');
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
